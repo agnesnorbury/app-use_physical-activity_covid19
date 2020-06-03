@@ -1,0 +1,498 @@
+---
+title: "EMA during COVID-19: Network analysis of daily summary data"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+#knitr options
+knitr::opts_chunk$set(echo=TRUE, error=TRUE, warning=FALSE, message=FALSE, fig.align="center")
+#knitr::opts_chunk$set(width = 200)
+
+#load packages
+packages<-c("dplyr", "tidyr", "reshape2", "imputeTS", "huge",
+            "mlVAR", "qgraph",
+            "ggplot2", "ggpubr", "ggpmisc", "ggcorrplot", "summarytools"
+            )
+if (length(setdiff(packages, rownames(installed.packages()))) > 0) {
+  install.packages(setdiff(packages, rownames(installed.packages())))
+}
+lapply(packages, require, character.only=TRUE)
+
+#function for custom colour scales for our subplots
+gg_color_hue <- function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+
+```
+
+## Background
+
+Here, we are interested in investigating the *predictive relationships* between **social media usage** (total time spent), **physical activity** (total steps), and **mood** (mean emotional valence), controlling for other (non-social) smartphone use.
+
+To do this, we will use multilevel vector autoregression (mlVAR) on time-series data represented as Gaussian graphical models (GGMs), following the approach outlined in Epskamp et al. 2018 (https://doi.org/10.1080/00273171.2018.1454823), and implemented in the R package mlVAR (https://cran.r-project.org/web/packages/mlVAR/).
+
+This will allow us to generate three networks:
+
+1. **Temporal network**. A GGM which depicts the lagged associations between measures across successive measurement times. This network shows if a deviation from a person's mean in one variable predicts a deviation from a person's mean in another variable at the next measurement occasion, and therefore gives insight into Granger causality.
+
+2. **Between-subjects network**. A GGM which models the covaraition between participants' means across measures (gives insight into random effects, or individual differences).
+
+3. **Contemporaneous network**. A GGM which depicts associations between measures within the same measurement window (here, each day), after controlling for temporal associations.
+
+For an example of this approach previously applied to real-world data (twice-daily PTSD symptom levels during a period of conflict), see Greene et al., 2018 (https://doi.org/10.1017/S0033291718000351).
+
+
+```{r load_data, include=FALSE}
+#load datafile with per day summary of activity variables
+data<-read.csv("../data/synthetic-data-2.csv", strip.white=TRUE)
+
+#make sure data is in correct format
+data$date.new<-as.Date(data$date.new)
+```
+
+First, let's select the data we want:
+
+```{r select_data, echo=FALSE}
+#subset data we want to use for this analysis
+dfA<-data %>%
+     dplyr::select(user, date.new,
+            steps_total, social_usage, nonsocial_usage, valence)
+```
+
+Then, define the variables to include in the model:
+
+```{r define_measures}
+#define measures for the analysis
+vars<-c("steps_total","social_usage", "nonsocial_usage", "valence")   
+shortnames<-c("steps", "social app", "nonsocial apps", "valence")   
+idvar<-"user"
+```
+
+Let's also plot the outcomes against each other, to see if we have obviously different time periods in the data, where statistical properties (e.g. mean) of times series and dynamics between variables might differ. 
+
+The vertical dotted line represents the declaration of a state of national emergency in Spain on the 14th March, 2020.
+
+```{r plot_data, echo=FALSE}
+#setup cross-plot colour palette for different variables
+palette<-gg_color_hue(7) #palette emulating ggplot default (equally spaced colours)
+colours<-c("steps_total" = palette[4],
+           "social_usage" = palette[5],
+           "nonsocial_usage" = palette[6],
+           "valence" = palette[7])
+
+#melt data to long format for ggplot
+dfA.melt<-melt(dfA, id.vars=c("user","date.new"), na.rm=FALSE)
+
+#get weekends throughtout period
+days<-seq(as.Date(min(dfA.melt$date.new)), as.Date(max(dfA.melt$date.new)), by="days")
+days.weekdays<-weekdays(days)
+#create new variable recording if that day was in a weekend or not
+days.is_weekend<-ifelse(grepl("Saturday", days.weekdays), 1,
+                        ifelse(grepl("Sunday", days.weekdays), 1,
+                        0))
+days.is_weekend<-as.logical(days.is_weekend)
+#and extract list of weekends for plotting
+wknds<-days[days.is_weekend==TRUE]
+
+#plot steps data
+dfA.melt.steps<-dfA.melt %>%
+                filter(variable=="steps_total")
+p1<-ggplot(dfA.melt.steps, aes(x=date.new, y=value, group=variable, color=variable)) +
+     theme_minimal() + theme(panel.grid.major.x = element_blank(), 
+                             panel.grid.minor.x = element_blank(),
+                             panel.grid.minor.y = element_blank(),
+                             panel.grid.major.y = element_line(colour="grey", size=.2)) +
+     theme(aspect.ratio=0.2) + #coord_fixed() +
+     theme(plot.margin=grid::unit(c(0,8,0,4), "mm")) +
+     geom_vline(xintercept=wknds, size=2.2, color="grey", alpha=.3) +
+     stat_summary(fun.y=mean, geom="line") +
+     stat_summary(fun.data=mean_se, geom="ribbon", aes(fill=variable), alpha=.2, colour = NA) +
+     scale_x_date(date_breaks = "2 week", date_labels =  "%d-%b") +
+     scale_colour_manual(values=colours, name="physical activity", 
+                         labels=c("total steps")) +
+     scale_fill_manual(values=colours, name="physical activity", 
+                         labels=c("total steps")) +
+     theme(legend.position="right") + 
+     geom_vline(xintercept=as.numeric(as.Date(c("2020-03-14"))), 
+                linetype="dashed", color="black", alpha=.5) +
+     labs(x="", y="steps")
+
+#plot app usage data
+dfA.melt.soc<-dfA.melt %>%
+              filter(variable=="social_usage" | variable=="nonsocial_usage")
+dfA.melt.soc$value<-dfA.melt.soc$value/60 #recode in minutes
+p2<-ggplot(dfA.melt.soc, aes(x=date.new, y=value, group=variable, color=variable)) +
+     theme_minimal() + theme(panel.grid.major.x = element_blank(), 
+                             panel.grid.minor.x = element_blank(),
+                             panel.grid.minor.y = element_blank(),
+                             panel.grid.major.y = element_line(colour="grey", size=.2)) +
+     theme(aspect.ratio=0.2) + #coord_fixed() +
+     theme(plot.margin=grid::unit(c(0,8,0,4), "mm")) +
+     geom_vline(xintercept=wknds, size=2.2, color="grey", alpha=.3) +
+     stat_summary(fun.y=mean, geom="line") +
+     stat_summary(fun.data=mean_se, geom="ribbon", aes(fill=variable), alpha=.2, colour = NA) +
+     scale_x_date(date_breaks = "2 week", date_labels =  "%d-%b") +
+     scale_colour_manual(values=colours, name="smartphone use", 
+                         labels=c("social app use", "other app use")) +
+     scale_fill_manual(values=colours, name="smartphone use", 
+                         labels=c("social app use", "other app use")) +
+     theme(legend.position="right") + 
+     geom_vline(xintercept=as.numeric(as.Date(c("2020-03-14"))), 
+                linetype="dashed", color="black", alpha=.5) +
+     labs(x="", y="time (mins)")
+
+#plot valence data
+dfA.melt.val<-dfA.melt %>%
+              filter(variable=="valence")
+p3<-ggplot(dfA.melt.val, aes(x=date.new, y=value, group=variable, color=variable)) +
+     theme_minimal() + theme(panel.grid.major.x = element_blank(), 
+                             panel.grid.minor.x = element_blank(),
+                             panel.grid.minor.y = element_blank(),
+                             panel.grid.major.y = element_line(colour="grey", size=.2)) +
+     theme(aspect.ratio=0.2) + #coord_fixed() +
+     theme(plot.margin=grid::unit(c(0,8,0,4), "mm")) +
+     geom_vline(xintercept=wknds, size=2.2, color="grey", alpha=.3) +
+     stat_summary(fun.y=mean, geom="line") +
+     stat_summary(fun.data=mean_se, geom="ribbon", aes(fill=variable), alpha=.2, colour = NA) +
+     scale_x_date(date_breaks = "2 week", date_labels =  "%d-%b") +
+     scale_colour_manual(values=colours, name="EMA data", 
+                         labels=c("emotional state")) +
+     scale_fill_manual(values=colours, name="EMA data", 
+                         labels=c("emotional state")) +
+     theme(legend.position="right") + 
+     geom_vline(xintercept=as.numeric(as.Date(c("2020-03-14"))), 
+                linetype="dashed", color="black", alpha=.5) +
+     labs(x="", y="mean valence")
+
+ggarrange(p1, p2, p3, ncol=1, align="v")
+
+```
+
+### With data adjusted for weekly seasonality
+
+For each measure, select data for each user, convert to time series format with weekly periodicity, decompose time series into different components (including seasonal variation, using stl), and then subtract the seasonal component from the time series. 
+
+NB, the decomposition process doesn't tolerate NAs, so here we will impute missing data for each user (using imputeTS), run the adjustment, then remove the imputed values at the end.
+
+```{r adjust_weekend}
+users<-as.numeric(unique(dfA$user))
+dfA.adj<-dfA
+
+#for steps:
+for (u in users) {
+  #select daily data for that user only
+  dfA.u<-dfA %>%
+         filter(user==u) %>%
+         arrange(date.new)
+  #impute NAs using TS impute as otherwise time series decomposition won't work
+  dfA.u$steps_total<-na_interpolation(dfA.u$steps_total)
+  #convert to time series data based on start date, with weekly periodicity
+  dfA.u.ts<-ts(dfA.u$steps_total, start=as.Date(dfA.u$date.new[1]), frequency=7)
+  #identify seasonal components in ts data:
+  ts.components<-stl(dfA.u.ts, s.window=7, s.degree = 0) 
+  #remove seasonal component from ts
+  dfA.u.ts.adj<-(dfA.u.ts - ts.components[["time.series"]][,1]) 
+  #add back to df
+  dfA.adj$steps_total[dfA.adj$user==u]<-dfA.u.ts.adj
+}
+#replace imputed data with NAs again
+dfA.adj$steps_total[is.na(dfA$steps_total)]<-NA
+
+
+#for social:
+for (u in users) {
+  #select daily data for that user only
+  dfA.u<-dfA %>%
+         filter(user==u) %>%
+         arrange(date.new)
+  #impute NAs using TS impute as otherwise time series decomposition won't work
+  dfA.u$social_usage<-na_interpolation(dfA.u$social_usage)
+  #convert to time series data based on start date, with weekly periodicity
+  dfA.u.ts<-ts(dfA.u$social_usage, start=as.Date(dfA.u$date.new[1]), frequency=7)
+  #identify seasonal components in ts data:
+  ts.components<-stl(dfA.u.ts, s.window=7, s.degree = 0) 
+  #remove seasonal component from ts
+  dfA.u.ts.adj<-(dfA.u.ts - ts.components[["time.series"]][,1]) 
+  #add back to df
+  dfA.adj$social_usage[dfA.adj$user==u]<-dfA.u.ts.adj
+}
+#replace imputed data with NAs again
+dfA.adj$social_usage[is.na(dfA$social_usage)]<-NA
+
+#for nonsocial:
+for (u in users) {
+  #select daily data for that user only
+  dfA.u<-dfA %>%
+         filter(user==u) %>%
+         arrange(date.new)
+  #impute NAs using TS impute as otherwise time series decomposition won't work
+  dfA.u$nonsocial_usage<-na_interpolation(dfA.u$nonsocial_usage)
+  #convert to time series data based on start date, with weekly periodicity
+  dfA.u.ts<-ts(dfA.u$nonsocial_usage, start=as.Date(dfA.u$date.new[1]), frequency=7)
+  #identify seasonal components in ts data [method 2]:
+  ts.components<-stl(dfA.u.ts, s.window=7, s.degree = 0) 
+  #remove seasonal component from ts
+  dfA.u.ts.adj<-(dfA.u.ts - ts.components[["time.series"]][,1]) 
+  #add back to df
+  dfA.adj$nonsocial_usage[dfA.adj$user==u]<-dfA.u.ts.adj
+}
+#replace imputed data with NAs again
+dfA.adj$nonsocial_usage[is.na(dfA$nonsocial_usage)]<-NA
+```
+
+Let's re-plot the data to see how successful this was:
+
+```{r plot_data_adj, echo=FALSE}
+#setup cross-plot colour palette for different variables
+palette<-gg_color_hue(7) #palette emulating ggplot default (equally spaced colours)
+colours<-c("steps_total" = palette[4],
+           "social_usage" = palette[5],
+           "nonsocial_usage" = palette[6],
+           "valence" = palette[7])
+
+#melt data to long format for ggplot
+dfA.adj$date.new<-as.Date(dfA.adj$date.new)
+dfA.adj.melt<-melt(dfA.adj, id.vars=c("user","date.new"), na.rm=FALSE)
+
+#get weekends throughtout period
+days<-seq(as.Date(min(dfA.adj.melt$date.new)), as.Date(max(dfA.adj.melt$date.new)), by="days")
+days.weekdays<-weekdays(days)
+#create new variable recording if that day was in a weekend or not
+days.is_weekend<-ifelse(grepl("Saturday", days.weekdays), 1,
+                        ifelse(grepl("Sunday", days.weekdays), 1,
+                        0))
+days.is_weekend<-as.logical(days.is_weekend)
+#and extract list of weekends for plotting
+wknds<-days[days.is_weekend==TRUE]
+
+#plot steps data
+dfA.melt.steps<-dfA.adj.melt %>%
+                filter(variable=="steps_total")
+p1<-ggplot(dfA.melt.steps, aes(x=date.new, y=value, group=variable, color=variable)) +
+     theme_minimal() + theme(panel.grid.major.x = element_blank(), 
+                             panel.grid.minor.x = element_blank(),
+                             panel.grid.minor.y = element_blank(),
+                             panel.grid.major.y = element_line(colour="grey", size=.2)) +
+     theme(aspect.ratio=0.2) + #coord_fixed() +
+     theme(plot.margin=grid::unit(c(0,8,0,4), "mm")) +
+     geom_vline(xintercept=wknds, size=2.2, color="grey", alpha=.3) +
+     stat_summary(fun.y=mean, geom="line") +
+     stat_summary(fun.data=mean_se, geom="ribbon", aes(fill=variable), alpha=.2, colour = NA) +
+     scale_x_date(date_breaks = "2 week", date_labels =  "%d-%b") +
+     scale_colour_manual(values=colours, name="physical activity", 
+                         labels=c("total steps")) +
+     scale_fill_manual(values=colours, name="physical activity", 
+                         labels=c("total steps")) +
+     theme(legend.position="right") + 
+     geom_vline(xintercept=as.numeric(as.Date(c("2020-03-14"))), 
+                linetype="dashed", color="black", alpha=.5) +
+     labs(x="", y="steps")
+
+#plot social data
+dfA.melt.soc<-dfA.adj.melt %>%
+              filter(variable=="social_usage" | variable=="nonsocial_usage")
+dfA.melt.soc$value<-dfA.melt.soc$value/60 #recode in minutes
+p2<-ggplot(dfA.melt.soc, aes(x=date.new, y=value, group=variable, color=variable)) +
+     theme_minimal() + theme(panel.grid.major.x = element_blank(), 
+                             panel.grid.minor.x = element_blank(),
+                             panel.grid.minor.y = element_blank(),
+                             panel.grid.major.y = element_line(colour="grey", size=.2)) +
+     theme(aspect.ratio=0.2) + #coord_fixed() +
+     theme(plot.margin=grid::unit(c(0,8,0,4), "mm")) +
+     geom_vline(xintercept=wknds, size=2.2, color="grey", alpha=.3) +
+     stat_summary(fun.y=mean, geom="line") +
+     stat_summary(fun.data=mean_se, geom="ribbon", aes(fill=variable), alpha=.2, colour = NA) +
+     scale_x_date(date_breaks = "2 week", date_labels =  "%d-%b") +
+     scale_colour_manual(values=colours, name="smartphone use", 
+                         labels=c("other app use", "social app use")) +
+     scale_fill_manual(values=colours, name="smartphone use", 
+                         labels=c("other app use", "social app use")) +
+     theme(legend.position="right") + 
+     geom_vline(xintercept=as.numeric(as.Date(c("2020-03-14"))), 
+                linetype="dashed", color="black", alpha=.5) +
+     labs(x="", y="time (mins)")
+
+#plot valence data
+dfA.melt.val<-dfA.adj.melt %>%
+                    filter(variable=="valence")
+p3<-ggplot(dfA.melt.val, aes(x=date.new, y=value, group=variable, color=variable)) +
+     theme_minimal() + theme(panel.grid.major.x = element_blank(),
+                             panel.grid.minor.x = element_blank(),
+                             panel.grid.minor.y = element_blank(),
+                             panel.grid.major.y = element_line(colour="grey", size=.2)) +
+     theme(aspect.ratio=0.2) + #coord_fixed() +
+     theme(plot.margin=grid::unit(c(0,8,0,4), "mm")) +
+     geom_vline(xintercept=wknds, size=2.2, color="grey", alpha=.3) +
+     stat_summary(fun.y=mean, geom="line") +
+     stat_summary(fun.data=mean_se, geom="ribbon", aes(fill=variable), alpha=.2, colour = NA) +
+     scale_x_date(date_breaks = "2 week", date_labels =  "%d-%b") +
+     scale_colour_manual(values=colours, name="EMA data",
+                         labels=c("emotional state")) +
+     scale_fill_manual(values=colours, name="EMA data",
+                         labels=c("emotional state")) +
+     theme(legend.position="right") +
+     geom_vline(xintercept=as.numeric(as.Date(c("2020-03-14"))),
+                linetype="dashed", color="black", alpha=.5) +
+     labs(x="", y="mean valence")
+
+ggarrange(p1, p2, p3, ncol=1, align="v")
+```
+
+```{r transform_adj, echo=FALSE}
+#view original, adjusted, and transformed data
+dfA_descr<-dfA %>%
+            dplyr::select(-c("user", "date.new"))
+view(dfSummary(dfA_descr, graph.magnif=0.75, varnumbers = FALSE, labels.col = FALSE, valid.col = FALSE,
+               na.col=FALSE), method="render")
+
+dfA_descr2<-dfA.adj %>%
+            dplyr::select(-c("user", "date.new"))
+view(dfSummary(dfA_descr2, graph.magnif=0.75, varnumbers = FALSE, labels.col = FALSE, valid.col = FALSE,
+               na.col=FALSE), method="render")
+```
+
+Next, let's divide the data into pre and post declaration of the national emergency. Let's also transform the data using a nonparanormal transformation (npn), as it appears significantly skewed.
+
+```{r select_data_prepost_adj}
+#create new variable dividing dates into relevant time bins:
+dfA.adj$date_bin<-ifelse(dfA.adj$date.new < "2020-03-14", 1,
+                        ifelse(dfA.adj$date.new >= "2020-03-14", 2,
+                      NA))
+
+#subset data we want to use for each analysis
+#pre-national emergency declaration:
+dfB_pre<-dfA.adj %>%
+         filter(date_bin==1)
+#post-national emergency declaration:
+dfB_post<-dfA.adj %>%
+         filter(date_bin==2)
+
+#npn transform, by session
+dfB_pre.complete<-dfB_pre[complete.cases(dfB_pre),]
+dfB_pre.npn<-dfB_pre.complete
+dfB_pre.npn[3:6]<-huge.npn(dfB_pre.npn[3:6])
+
+dfB_post.complete<-dfB_post[complete.cases(dfB_post),]
+dfB_post.npn<-dfB_post.complete
+dfB_post.npn[3:6]<-huge.npn(dfB_post.npn[3:6])
+
+#melt/cast to get full date coverage
+#since mlVAR doesn't make use of the dayvar (date.new) if only one daily observation, we need to add ordering / NA padding to ensure observations line up properly (an no false consecutive days when missing data)
+dfB_pre.melt<-melt(dfB_pre.npn, id.vars=c("user","date.new"), na.rm=FALSE) #melt down
+dfB_pre.cast<-dcast(dfB_pre.melt, user ~ date.new + variable, median, fill=NaN) #make wide so that all subs have a column for all date/var pairs
+dfB_pre.melt2<-melt(dfB_pre.cast, id.vars="user") #melt down to long again, now with missing values filled as NaNs
+dfB_pre.melt2<-separate(dfB_pre.melt2, variable, c("date.new","variable"), sep = "_", extra="merge") #split paired date/var back up again
+dfB_pre.melt2$value[is.nan(dfB_pre.melt2$value)]<-NA  #replace NaN padding with NAs
+dfB_pre.cast2<-dcast(dfB_pre.melt2, user + date.new ~ variable) #create separate columns for each measurement variable again as preferred by mlVAR
+
+#since mlVAR doesn't make use of the dayvar (date.new) if only one daily observation, we need to add ordering / NA padding to ensure observations line up properly (an no false consecutive days when missing data)
+dfB_post.melt<-melt(dfB_post.npn, id.vars=c("user","date.new"), na.rm=FALSE) #melt down
+dfB_post.cast<-dcast(dfB_post.melt, user ~ date.new + variable, median, fill=NaN) #make wide so that all subs have a column for all date/var pairs
+dfB_post.melt2<-melt(dfB_post.cast, id.vars="user") #melt down to long again, now with missing values filled as NaNs
+dfB_post.melt2<-separate(dfB_post.melt2, variable, c("date.new","variable"), sep = "_", extra="merge") #split paired date/var back up again
+dfB_post.melt2$value[is.nan(dfB_post.melt2$value)]<-NA  #replace NaN padding with NAs
+dfB_post.cast2<-dcast(dfB_post.melt2, user + date.new ~ variable) #create separate columns for each measurement variable again as preferred by mlVAR
+```
+
+Finally, let's estimate the networks using mlVAR. We'll run this a couple of times (passing backwards then forwards again), to ensure only users who have enough data to contribute to both networks are included in either.
+
+```{r mlVAR_prepost_adj, results='hide'}
+#estimate using two-step mlVAR, for post emergency data:
+res_mlVAR_post<-mlVAR(dfB_post.cast2, vars, idvar, lags = c(1), temporal="correlated", estimator="lmer")
+#restrict users in pre-emergency dataset to only those with enough post emergency data:
+subs_post<-as.integer(res_mlVAR_post[["IDs"]])
+dfB_pre<-dfB_pre.cast2 %>%
+         filter(user %in% subs_post)
+#and pass back to exlcude ppts only in post-emergency
+res_mlVAR_pre<-mlVAR(dfB_pre.cast2, vars, idvar, lags = c(1), temporal="correlated", estimator="lmer")
+subs_pre<-as.integer(res_mlVAR_pre[["IDs"]])
+dfB_post<-dfB_post.cast2 %>%
+          filter(user %in% subs_pre)
+
+#re-estimate both time periods using two-step mlVAR:
+res_mlVAR_pre<-mlVAR(dfB_pre, vars, idvar, lags = c(1), temporal="correlated", estimator="lmer")
+res_mlVAR_post<-mlVAR(dfB_post, vars, idvar, lags = c(1), temporal="correlated", estimator="lmer")
+```
+
+
+
+```{r mlVAR_prepost_results_adj, echo=FALSE}
+#number of users in models
+print(paste("Number of users included in the pre-emergency model: ", length(res_mlVAR_pre[["IDs"]])),
+      quote=FALSE)
+print(paste("Number of users included in the post-emergency model: ", length(res_mlVAR_post[["IDs"]])),
+      quote=FALSE)
+#number of days in models
+print(paste("Number of days included in the pre-emergency model: ", length(unique(res_mlVAR_pre[["data"]][["BEEP"]]))),
+      quote=FALSE)
+print(paste("Number of days included in the post-emergency model: ", length(unique(res_mlVAR_post[["data"]][["BEEP"]]))),
+      quote=FALSE)
+
+#plot networks side-by-side
+layout(t(1:2))
+temp.pre<-plot(res_mlVAR_pre, "temporal", layout = "circle", nonsig = "hide", theme = "colorblind", 
+               title = "temporal pre", 
+               labels = shortnames, 
+               label.scale.equal=TRUE, label.cex=2, 
+               edge.labels=TRUE, edge.label.cex=1.3, edge.label.margin=0.04,
+               vsize = 15, rule = "and", asize = 10, mar=c(10,5,10,5))
+temp.post<-plot(res_mlVAR_post, "temporal", layout = temp.pre$layout, nonsig = "hide", theme = "colorblind", 
+               title = "temporal post", 
+               labels = shortnames, 
+               label.scale.equal=TRUE, label.cex=2, 
+               edge.labels=TRUE, edge.label.cex=1.3, edge.label.margin=0.04,
+               vsize = 15, rule = "and", asize = 10, mar=c(10,5,10,5))
+
+layout(t(1:2))
+bw.pre<-plot(res_mlVAR_pre, "between", layout = temp.pre$layout, nonsig = "hide",  theme = "colorblind", 
+               title = "between-subjects pre", 
+               labels = shortnames, 
+               label.scale.equal=TRUE, label.cex=2, 
+               edge.labels=TRUE, edge.label.cex=1.3, edge.label.margin=0.04,
+               vsize = 15, rule = "and", asize = 10, mar=c(10,5,10,5))
+bw.post<-plot(res_mlVAR_post, "between", layout = temp.pre$layout, nonsig = "hide",  theme = "colorblind", 
+               title = "between-subjects post", 
+               labels = shortnames, 
+               label.scale.equal=TRUE, label.cex=2, 
+               edge.labels=TRUE, edge.label.cex=1.3, edge.label.margin=0.04,
+               vsize = 15, rule = "and", asize = 10, mar=c(10,5,10,5))
+
+layout(t(1:2))
+plot(res_mlVAR_pre, "contemporaneous", layout = temp.pre$layout, nonsig = "hide", theme = "colorblind", 
+     title = "contemporaneous pre", 
+     labels = shortnames, 
+     label.scale.equal=TRUE, label.cex=2, edge.labels=TRUE,
+     vsize = 15, rule = "and", asize = 10, mar=c(5,5,10,5))
+plot(res_mlVAR_post, "contemporaneous", layout = temp.pre$layout, nonsig = "hide", theme = "colorblind", 
+     title = "contemporaneous post",
+     labels = shortnames, 
+     label.scale.equal=TRUE, label.cex=2, edge.labels=TRUE,
+     vsize = 15, rule = "and", asize = 10, mar=c(5,5,10,5))
+
+#summary of models and correlation /covariation matrices
+print(paste("Pre-emergency model summary: "), quote=FALSE)
+summary(res_mlVAR_pre)
+print(paste("Pre-emergency correlation matrix: "), quote=FALSE)
+res_mlVAR_pre$results$Omega_mu$cor$mean
+print(paste("Post-emergency model summary: "), quote=FALSE)
+summary(res_mlVAR_post)
+print(paste("Post-emergency correlation matrix: "), quote=FALSE)
+res_mlVAR_post$results$Omega_mu$cor$mean
+```
+
+```{r mlVAR_prepost_lag_compare}
+#pre
+res_mlVAR_pre.1<-mlVAR(dfB_pre, vars, idvar, lags = c(1), temporal="correlated", estimator="lmer",
+                     compareToLags=c(1,2))
+res_mlVAR_pre.12<-mlVAR(dfB_pre, vars, idvar, lags = c(1,2), temporal="correlated", estimator="lmer",
+                     compareToLags=c(1,2))
+mlVARcompare(res_mlVAR_pre.1, res_mlVAR_pre.12)
+
+#post
+res_mlVAR_post.1<-mlVAR(dfB_post, vars, idvar, lags = c(1), temporal="correlated", estimator="lmer",
+                     compareToLags=c(1,2))
+res_mlVAR_post.12<-mlVAR(dfB_post, vars, idvar, lags = c(1,2), temporal="correlated", estimator="lmer",
+                     compareToLags=c(1,2))
+mlVARcompare(res_mlVAR_post.1, res_mlVAR_post.12)
+```
