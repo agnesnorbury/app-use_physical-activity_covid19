@@ -9,8 +9,8 @@ knitr::opts_chunk$set(echo=TRUE, error=TRUE, warning=FALSE, message=FALSE, fig.a
 #knitr::opts_chunk$set(width = 200)
 
 #load packages
-packages<-c("dplyr", "tidyr", "reshape2", "imputeTS", "huge",
-            "mlVAR", "qgraph",
+packages<-c("dplyr", "tidyr", "reshape2", "imputeTS", 
+            "huge", "mlVAR", "qgraph", "parSim",
             "ggplot2", "ggpubr", "ggpmisc", "ggcorrplot", "summarytools"
             )
 if (length(setdiff(packages, rownames(installed.packages()))) > 0) {
@@ -389,13 +389,13 @@ temp.pre<-plot(res_mlVAR_pre, "temporal", layout = "circle", nonsig = "hide", th
                labels = shortnames, 
                label.scale.equal=TRUE, label.cex=2, 
                edge.labels=TRUE, edge.label.cex=1.3, edge.label.margin=0.04,
-               vsize = 15, rule = "and", asize = 10, mar=c(5,5,10,5))
+               vsize = 15, asize = 10, mar=c(5,5,10,5))
 temp.post<-plot(res_mlVAR_post, "temporal", layout = temp.pre$layout, nonsig = "hide", theme = "colorblind", 
                title = "temporal post", 
                labels = shortnames, 
                label.scale.equal=TRUE, label.cex=2, 
                edge.labels=TRUE, edge.label.cex=1.3, edge.label.margin=0.04,
-               vsize = 15, rule = "and", asize = 10, mar=c(5,5,10,5))
+               vsize = 15, asize = 10, mar=c(5,5,10,5))
 
 #2. between subjects network
 layout(t(1:2))
@@ -454,4 +454,402 @@ res_mlVAR_post.12<-mlVAR(dfB_post, vars, idvar, lags = c(1,2), temporal="correla
 res_mlVAR_post.123<-mlVAR(dfB_post, vars, idvar, lags = c(1,2,3), temporal="correlated", estimator="lmer",
                      compareToLags=c(1,2,3))
 mlVARcompare(res_mlVAR_post.1, res_mlVAR_post.12, res_mlVAR_post.123)
+```
+
+Let's next examine the stability of the estimated networks using the case-drop bootstrap approach described in (Epskamp, Borsboom, & Fried, 2017). 
+
+Specifically, we will follow the multi-subject example outlined in Epskamp (2020) (see 10.1007/s11336-020-09697-3), i.e., estimate 1000 bootstrapped networks with a random 25% of participants dropped from the original sample each time.
+
+```{r mlVAR_prepost_stability_bootstrap}
+#make sure only sampling users from pre-post models
+users<-as.numeric(res_mlVAR_pre[["IDs"]])
+
+#create subdir to save boots for reproducibility purposes
+dir.create('./network-1-bootstraps/pre')
+dir.create('./network-1-bootstraps/post')
+
+nBoots=1000
+users.boot<-vector("list", length(nBoots))
+for (bootNo in seq(1,nBoots)) {
+  #select random sample of 75% of users (25% subject-level case drop)
+  users.boot<-sample(users, round(0.75*length(users)))
+  #grab data for these users
+  dfB_pre.boot<-dfB_pre %>%
+         filter(user %in% users.boot)
+  dfB_post.boot<-dfB_post %>%
+         filter(user %in% users.boot)
+  #run mlVAR models on case-dropped subsamples [pre-lockdown]
+  res_mlVAR_pre.boot<-mlVAR(dfB_pre.boot, vars, idvar, lags = c(1), 
+                            temporal="correlated", estimator="lmer")
+  saveRDS(res_mlVAR_pre.boot, file = paste0("./network-1-bootstraps/pre/mlVARboot", bootNo, ".rds"))
+  #run mlVAR models on case-dropped subsamples [pre-lockdown]
+  res_mlVAR_post.boot<-mlVAR(dfB_post.boot, vars, idvar, lags = c(1), 
+                            temporal="correlated", estimator="lmer")
+  saveRDS(res_mlVAR_post.boot, file = paste0("./network-1-bootstraps/post/mlVARboot", bootNo, ".rds"))
+}
+```
+
+Now, let's look at the results of the case-drop bootstrap for each network (code stolen from Epskamp 2020; https://osf.io/7b9ms/)
+
+```{r mlVAR_prepost_stability_results}
+#define some helper functions (adapted from those in Epskamp 2020 supplementary material, see: https://osf.io/9gq2d/):
+edgeInclude <- function(x, mat, transpose = FALSE){
+  n <- length(x)
+  res <- 1/n * Reduce("+", lapply(x, function(x) x[[mat]]!=0))
+  if (transpose){
+    res <- t(res)
+  }
+  nBoots * res
+}
+
+signInclude <- function(x, mat, transpose = FALSE, lowertri = FALSE){
+  Pos <- lapply(x, function(x) x[[mat]]>0)
+  inclPos <- 1/length(x) * Reduce("+",Pos)
+  dfPos <- data.frame(
+    from = c(row(inclPos)),
+    to = c(col(inclPos)),
+    incl = c(inclPos),
+    type = "pos"
+  )
+  Neg <- lapply(x, function(x) x[[mat]]<0)
+  inclNeg <- 1/length(x) * Reduce("+",Neg)
+  dfNeg <- data.frame(
+    from = c(row(inclNeg)),
+    to = c(col(inclNeg)),
+    incl = c(inclNeg),
+    type = "neg"
+  )
+  tab <- rbind(dfPos,dfNeg)
+  if (transpose){
+    tab[,1:2] <- tab[,2:1]
+  }
+  if (lowertri){
+    tab <- tab[tab$from >= tab$to,]
+  }
+  tab
+}
+
+#####pre-lockdown###########
+#read 75% bootstraps:
+files<-list.files(path="./network-1-bootstraps/pre/", pattern="mlVARboot", full.names=TRUE)
+bootstraps<-vector("list", nBoots)
+for (f in seq (1, nBoots)) {
+  bootstraps[[f]]$temporal<-getNet(readRDS(files[f]), "temporal")
+  bootstraps[[f]]$contemporaneous<-getNet(readRDS(files[f]), "contemporaneous")
+  bootstraps[[f]]$between<-getNet(readRDS(files[f]), "between")
+}
+saveRDS(bootstraps, "./network-1-bootstraps/pre/all_bootstrapped_nets.rds")
+
+#read full sample estimated network:
+res_mlVAR_pre<-readRDS("./network-1-results/results_mlVAR_pre.rds")
+temporal.pre<-getNet(res_mlVAR_pre, "temporal")
+contemporaneous.pre<-getNet(res_mlVAR_pre, "contemporaneous")
+between.pre<-getNet(res_mlVAR_pre, "between")
+
+#get bootstrap results (number of times edges retained across bootstraps):
+#inclusion over edges (disregard sign):
+#temporal:
+tempInclude_noSign<-edgeInclude(bootstraps, "temporal")
+print(paste("Pre-emergency temporal network edge inclusion: "), quote=FALSE)
+print(tempInclude_noSign)
+#contemporaneous (lowertri);
+contInclude_noSign<-edgeInclude(bootstraps, "contemporaneous")
+print(paste("Pre-emergency contemporaneous network edge inclusion: "), quote=FALSE)
+print(contInclude_noSign)
+#between (lowertri):
+betInclude_noSign<-edgeInclude(bootstraps, "between")
+print(paste("Pre-emergency between-users network edge inclusion: "), quote=FALSE)
+print(betInclude_noSign)
+
+#visualise bootstrap inclusions probabilities
+tempInclude<-signInclude(bootstraps, "temporal", transpose = FALSE)
+contInclude<-signInclude(bootstraps, "contemporaneous", lowertri = TRUE)
+betInclude<-signInclude(bootstraps, "between", lowertri = TRUE)
+
+qgraph(tempInclude[,1:3], layout = temp.pre$layout, theme = "colorblind",  
+       vsize = 15, asize = 10, mar=c(5,5,10,5), directed = TRUE,
+       labels = shortnames,  maximum = 1, esize = 10,
+       edge.labels=TRUE, edge.label.cex=1.3, edge.label.margin=0.04,
+       edge.color = ifelse(tempInclude$type=="pos","#0000D5","#BF0000"),
+       vTrans = 254, diag = TRUE, label.scale.equal = TRUE, label.cex=2, parallelEdge = TRUE)
+
+qgraph(contInclude[,1:3], layout = temp.pre$layout, theme = "colorblind", 
+       vsize = 15, asize = 10, mar=c(5,5,10,5), directed = FALSE,
+       labels = shortnames, maximum = 1, esize = 10,
+       edge.labels=TRUE, edge.label.cex=1.3, edge.label.margin=0.04,
+       edge.color = ifelse(contInclude$type=="pos","#0000D5","#BF0000"),
+       vTrans = 254, label.scale.equal = TRUE, label.cex=2, parallelEdge = TRUE)
+
+qgraph(betInclude[,1:3], layout = temp.pre$layout, theme = "colorblind",
+       vsize = 15, asize = 10, mar=c(5,5,10,5), directed = FALSE,
+       labels = shortnames, maximum = 1, esize = 10,
+       edge.labels=TRUE, edge.label.cex=1.3, edge.label.margin=0.04,
+       edge.color = ifelse(betInclude$type=="pos","#0000D5","#BF0000"),
+       vTrans = 254, label.scale.equal = TRUE, label.cex=2, parallelEdge = TRUE)
+
+#####post-lockdown###########
+#read 75% bootstraps:
+files<-list.files(path="./network-1-bootstraps/post/", pattern="mlVARboot", full.names=TRUE)
+bootstraps<-vector("list", nBoots)
+for (f in seq (1, nBoots)) {
+  bootstraps[[f]]$temporal<-getNet(readRDS(files[f]), "temporal")
+  bootstraps[[f]]$contemporaneous<-getNet(readRDS(files[f]), "contemporaneous")
+  bootstraps[[f]]$between<-getNet(readRDS(files[f]), "between")
+}
+saveRDS(bootstraps, "./network-1-bootstraps/post/all_bootstrapped_nets.rds")
+
+#read full sample estimated network:
+res_mlVAR_post<-readRDS("./network-1-results/results_mlVAR_post.rds")
+temporal.post<-getNet(res_mlVAR_post, "temporal")
+contemporaneous.post<-getNet(res_mlVAR_post, "contemporaneous")
+between.post<-getNet(res_mlVAR_post, "between")
+
+#get bootstrap results (number of times edges retained across bootstraps):
+#inclusion over edges (disregard sign):
+#temporal:
+tempInclude_noSign<-edgeInclude(bootstraps, "temporal")
+print(paste("Post-emergency temporal network edge inclusion: "), quote=FALSE)
+print(tempInclude_noSign)
+#contemporaneous (lowertri);
+contInclude_noSign<-edgeInclude(bootstraps, "contemporaneous")
+print(paste("Post-emergency contemporaneous network edge inclusion: "), quote=FALSE)
+print(contInclude_noSign)
+#between (lowertri):
+betInclude_noSign<-edgeInclude(bootstraps, "between")
+print(paste("Post-emergency between-users network edge inclusion: "), quote=FALSE)
+print(betInclude_noSign)
+
+#visualise bootstrap inclusions probabilities
+tempInclude<-signInclude(bootstraps, "temporal", transpose = FALSE)
+contInclude<-signInclude(bootstraps, "contemporaneous", lowertri = TRUE)
+betInclude<-signInclude(bootstraps, "between", lowertri = TRUE)
+
+qgraph(tempInclude[,1:3], layout = temp.pre$layout, theme = "colorblind",  
+       vsize = 15, asize = 10, mar=c(5,5,10,5), directed = TRUE,
+       labels = shortnames,  maximum = 1, esize = 10,
+       edge.labels=TRUE, edge.label.cex=1.3, edge.label.margin=0.04,
+       edge.color = ifelse(tempInclude$type=="pos","#0000D5","#BF0000"),
+       vTrans = 254, diag = TRUE, label.scale.equal = TRUE, label.cex=2, parallelEdge = TRUE)
+
+qgraph(contInclude[,1:3], layout = temp.pre$layout, theme = "colorblind", 
+       vsize = 15, asize = 10, mar=c(5,5,10,5), directed = FALSE,
+       labels = shortnames, maximum = 1, esize = 10,
+       edge.labels=TRUE, edge.label.cex=1.3, edge.label.margin=0.04,
+       edge.color = ifelse(contInclude$type=="pos","#0000D5","#BF0000"),
+       vTrans = 254, label.scale.equal = TRUE, label.cex=2, parallelEdge = TRUE)
+
+qgraph(betInclude[,1:3], layout = temp.pre$layout, theme = "colorblind",
+       vsize = 15, asize = 10, mar=c(5,5,10,5), directed = FALSE,
+       labels = shortnames, maximum = 1, esize = 10,
+       edge.labels=TRUE, edge.label.cex=1.3, edge.label.margin=0.04,
+       edge.color = ifelse(betInclude$type=="pos","#0000D5","#BF0000"),
+       vTrans = 254, label.scale.equal = TRUE, label.cex=2, parallelEdge = TRUE)
+```
+Next, let's examine power-related properties of the estimated networks at different sample sizes using the simulation-based approach taken in Epskamp (2020). 
+
+Specifically, we will investigate the sensitivity, specificity, and the correlation between original ('true') and estimated network parameters at each sample size using 100 simulated networks (see also Epskamp & Fried, 2018).
+
+```{r mlVAR_prepost_power}
+########pre-emergency#############
+object<-res_mlVAR_pre
+########pre-emergency#############
+#object<-res_mlVAR_post
+
+##################################
+## Setup data to base simulation on:
+# Get Beta matrices:
+Beta<-object$results$Beta$subject
+# Check if all are stationary:
+stationary <- sapply(Beta,function(b){
+    ev <- eigen(b[,,1])$values
+    all(Re(ev)^2 + Im(ev)^2 < 1)
+})
+# Inverse thetas:
+invTheta <- lapply(object$results$Theta$cov$subject,solve)
+# Check for outling variance in contemoraneous cov matrices:
+contVar <- sapply(invTheta,function(x)sum(diag(solve(x))))
+# Remove all 10* higher than median:
+goodVar <- contVar < 10*median(contVar)
+# Intercepts:
+Means <- object$results$mu$subject
+if (any(!goodVar | !stationary)){
+    warning(paste0("Model for subject(s) ",paste(which(!goodVar | !stationary),collapse=" "),
+                   " are not proper removed from simulation"))
+    keep <- goodVar | stationary
+    invTheta <- invTheta[keep]
+    Beta <- Beta[keep]
+    Means <- Means[keep]
+ }
+  
+### SIMULATION ###
+nCores = 8
+nTime = 38 #45 for post-emergency
+nSubject = c(127,200,500,1000)
+nReps = 100
+  
+Results <- parSim(
+    # timepoints conditions:
+    nTime = nTime,
+    # number of subjects conditions:
+    nSubject = nSubject, #length(Beta)
+    # Setup:
+    name = "mlVARsim",
+    write = FALSE,
+    nCores = nCores, # Change this to use more or less computer cores
+    reps = nReps, # Number of repetitions per condition
+    debug = FALSE,
+    export = c("cor0","CompareNetworks","bias","object","invTheta","Means","Beta"),
+    
+    # The simulation code:
+    expression = {
+      # Input
+      input <- c(object$input)
+      input$idvar <- "id"
+      
+      # Simulate data:
+      simData <- mapply(id = 1:nSubject, b = Beta, k = invTheta, m = Means, SIMPLIFY = FALSE, 
+                        FUN = function(id, b, k, m){
+                          data <- graphicalVAR::graphicalVARsim(nTime, b[,,1], k, m)
+                          data <- as.data.frame(data)
+                          names(data) <- input$vars
+                          data$id <- id
+                          data
+                        })
+      simData <- do.call(rbind, simData)
+      
+      # Fit model:
+      Res <- do.call(mlVAR::mlVAR, c(list(data=simData), input))
+      
+      #Fixed effects, thresholded:
+      # True networks:
+      truePDC <- mlVAR::getNet(object, "temporal", nonsig = "hide")
+      truePCC <- mlVAR::getNet(object, "contemporaneous", nonsig = "hide", rule = "and")
+      trueBW <- mlVAR::getNet(object, "between", nonsig = "hide", rule = "and")
+      # Estimated networks:
+      estPDC <- mlVAR::getNet(Res, "temporal", nonsig = "hide")
+      estPCC <- mlVAR::getNet(Res, "contemporaneous", nonsig = "hide")
+      estBW <-  mlVAR::getNet(Res, "between", nonsig = "hide", rule = "and")
+      # Compare est vs true networks:
+      PDCres <- CompareNetworks(truePDC, estPDC, directed = TRUE)
+      PDCres$network <- "temporal"
+      PCCres <- CompareNetworks(truePCC, estPCC, directed = FALSE)
+      PCCres$network <- "contemporaneous"
+      BWres <- CompareNetworks(trueBW, estBW, directed = FALSE)
+      BWres$network <- "between"
+      
+      Results <- data.frame(
+        network = c("temporal_fixed", "contemporaneous_fixed", "between"),
+        correlation = c(PDCres$Correlation, PCCres$Correlation, BWres$Correlation), 
+        sensitivity = c(PDCres$sensitivity, PCCres$sensitivity, BWres$sensitivity),
+        specificity = c(PDCres$specificity, PCCres$specificity, BWres$specificity),
+        truePos = c(PDCres$TruePos, PCCres$TruePos, BWres$TruePos),
+        falsePos = c(PDCres$FalsePos, PCCres$FalsePos, BWres$FalsePos),
+        trueNeg = c(PDCres$TrueNeg, PCCres$TrueNeg, BWres$TrueNeg),
+        falseNeg = c(PDCres$FalseNeg, PCCres$FalseNeg, BWres$FalseNeg)
+      )
+      return(Results)
+    }) 
+saveRDS(Results, file="./network-1-sim-Results-post.rds")
+
+#helper functions:
+bias <- function(x,y) mean(abs(x-y), na.rm=TRUE)
+CompareNetworks <- function(true,est, directed = TRUE){
+  if (is.matrix(true) & is.matrix(est)){
+    if (directed){
+      real <- c(true)
+      est <- c(est)
+    } else {
+      real <- true[upper.tri(true,diag=FALSE)]
+      est <- est[upper.tri(est,diag=FALSE)]
+    }        
+  } else {
+    real <- true
+  }
+  # True positives:
+  TruePos <- sum(est != 0 &  real != 0)
+  # False pos:
+  FalsePos <- sum(est != 0 & real == 0)
+  # True Neg:
+  TrueNeg <- sum(est == 0 & real == 0)
+  # False Neg:
+  FalseNeg <- sum(est == 0 & real != 0)
+  
+  out <- list()
+  # Sensitivity:
+  out$sensitivity <- TruePos / (TruePos + FalseNeg)
+  # Specificity:
+  out$specificity <- TrueNeg / (TrueNeg + FalsePos)
+  # Correlation:
+  out$Correlation <- cor0(est, real)
+  # Bias
+  out$Bias <- bias(est,real)
+  # rest
+  out$TruePos <- TruePos
+  out$FalsePos <- FalsePos
+  out$TrueNeg <- TrueNeg
+  out$FalseNeg <- FalseNeg
+  
+  return(out)
+}
+cor0 <- function(x,y,...){
+  if (sum(!is.na(x)) < 2 || sum(!is.na(y)) < 2 || sd(x,na.rm=TRUE)==0 | sd(y,na.rm=TRUE) == 0){
+    return(0)
+  } else {
+    return(cor(x,y,...))
+  }
+}
+```
+
+```{r mlvar_prepost_power_results, echo=FALSE}
+########pre-emergency#############
+sim.files<-list.files(pattern = "network-1-sim-Results-pre", path = "./network-1-simulations/", full.names = TRUE)
+########post-emergency#############
+# sim.files<-list.files(pattern = "network-1-sim-Results-post", path = "./network-1-simulations/", full.names = TRUE)
+
+#load and concatenate simulation results files
+sim.res<-do.call(rbind, lapply(sim.files, readRDS))
+
+#gather data
+sim.gathered <- sim.res %>% 
+  dplyr::select(nSubject, network, sensitivity, specificity, correlation) %>%
+  gather(metric, value, sensitivity:correlation)
+
+#summarize
+sim.summarized <- sim.gathered %>%
+  group_by(network, nSubject, metric) %>%
+  summarize(
+    mean=mean(value, na.rm=TRUE),
+    median=median(value, na.rm=TRUE),
+    q25=quantile(value, 0.25, na.rm=TRUE),
+    q75=quantile(value, 0.75, na.rm=TRUE)
+  )
+sim.temp <- sim.gathered %>%
+  filter(network=="temporal")
+
+#plot
+plot.sim <- ggplot(sim.summarized, aes(x = factor(nSubject), y = mean, colour = network, group = network)) +
+  geom_line() + geom_point() +
+  facet_grid( ~ metric) + 
+  theme_bw() + 
+  xlab("Number of users")+
+  ylab("") +
+  scale_fill_discrete("") + 
+  theme(legend.position = "top") + 
+  ggplot2::scale_y_continuous(limits=c(0,1),breaks=seq(0,1,by=0.2)) +
+  theme( panel.grid.major.x = element_blank(), panel.grid.minor.x = element_blank()) +
+  scale_colour_discrete("") + 
+  guides(col = guide_legend(nrow = 3, byrow = FALSE), size = FALSE, alpha = FALSE) + 
+  theme(legend.text=element_text(size=7)) + 
+  scale_size_manual(values = c(1,1.5))
+plot.sim
+
+plot.sim.temp<-ggplot(sim.temp, aes(x = factor(nSubject), y = value)) +
+  geom_boxplot(outlier.size = 0.5, lwd=0.5, fatten=0.5, position = position_dodge2(preserve = "total")) +
+  facet_grid( ~ metric) + 
+  theme_bw() +
+  xlab("Number of users") + 
+  ylab("") +
+  theme(panel.grid.major.x = element_blank(), panel.grid.minor.x = element_blank()) +
+  theme(legend.position = "top")
+plot.sim.temp  
 ```
